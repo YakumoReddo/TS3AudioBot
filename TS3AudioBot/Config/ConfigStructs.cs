@@ -252,6 +252,7 @@ namespace TS3AudioBot.Config
 		public ConfigValue<float> Max { get; } = new ConfigValue<float>("max", 75);
 	}
 
+
 	public class ConfPlaylists : ConfigTable
 	{
 		//public ConfigValue<int> MaxItemCount { get; } = new ConfigValue<int>("max_item_count", 1000); // TODO

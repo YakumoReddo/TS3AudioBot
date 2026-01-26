@@ -201,6 +201,8 @@ namespace TS3AudioBot.Audio
 			playerConnection.Volume = Tools.Clamp(playerConnection.Volume, confBot.Audio.Volume.Min, confBot.Audio.Volume.Max);
 			CurrentPlayData = playInfo; // TODO meta as readonly
 			await AfterResourceStarted.InvokeAsync(this, playInfo);
+			Player.TimePipe.AudioTimer.Reset();
+			Player.TimePipe.Paused = false;
 		}
 
 		private async Task StartCurrent(InvokerData invoker, bool manually = true)
