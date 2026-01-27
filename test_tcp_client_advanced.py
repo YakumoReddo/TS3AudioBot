@@ -28,6 +28,16 @@ PACKET_VOICE_INPUT = 1
 PACKET_AUDIO_FROM_CLIENT = 2
 PACKET_COMMAND = 3
 
+# Codec types (must match TSLib/TsEnums.cs Codec enum)
+# SpeexNarrowband = 0
+# SpeexWideband = 1
+# SpeexUltraWideband = 2
+# CeltMono = 3
+# OpusVoice = 4  (mono, 48kHz)
+# OpusMusic = 5  (stereo, 48kHz)
+CODEC_OPUS_VOICE = 4
+CODEC_OPUS_MUSIC = 5
+
 # Command types
 CMD_STOP = 0
 CMD_CLEAR_QUEUE = 1
@@ -54,7 +64,7 @@ def send_command(sock, command_type):
     sock.sendall(packet)
 
 
-def send_audio(sock, opus_data, codec=1):
+def send_audio(sock, opus_data, codec=CODEC_OPUS_MUSIC):
     """Send audio data to be played by the bot."""
     # [Length:4][PacketType:1=2][Codec:1][AudioData:N]
     length = 1 + 1 + len(opus_data)
@@ -189,7 +199,7 @@ def main():
                     audio_output_count += 1
                     
                     # Decode Opus to PCM
-                    if codec in [0, 1]:  # OpusVoice or OpusMusic
+                    if codec in [CODEC_OPUS_VOICE, CODEC_OPUS_MUSIC]:  # OpusVoice or OpusMusic
                         try:
                             # Decode Opus frame (960 samples = 20ms at 48kHz)
                             pcm_data = music_decoder.decode(audio_data, frame_size=960)
@@ -217,8 +227,8 @@ def main():
                     active_speakers = [sid for sid, t in speaker_activity.items() if time.time() - t < 1.0]
                     
                     # Determine channels based on codec
-                    # OpusVoice (0) = mono, OpusMusic (1) = stereo
-                    voice_channels = 1 if codec == 0 else 2
+                    # OpusVoice (4) = mono, OpusMusic (5) = stereo
+                    voice_channels = 1 if codec == CODEC_OPUS_VOICE else 2
                     
                     # Create decoder and wav file for this speaker if needed
                     if sender_id not in voice_decoders:

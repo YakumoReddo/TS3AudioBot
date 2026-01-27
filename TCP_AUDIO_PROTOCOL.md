@@ -100,21 +100,24 @@ Command Types:
 | Resume | 3 | Resume playback |
 
 ### Codec Types
-- `0` = OpusVoice (Opus codec, voice quality, mono)
-- `1` = OpusMusic (Opus codec, music quality, stereo) - **Default for bot output**
-- `2` = Speex (legacy)
-- `3` = Celt (legacy)
+The codec types match the TeamSpeak Codec enum values:
+- `0` = SpeexNarrowband (mono, 8kHz) - legacy
+- `1` = SpeexWideband (mono, 16kHz) - legacy
+- `2` = SpeexUltraWideband (mono, 32kHz) - legacy
+- `3` = CeltMono (mono, 48kHz) - legacy
+- `4` = OpusVoice (mono, 48kHz, optimized for voice)
+- `5` = OpusMusic (stereo, 48kHz, optimized for music) - **Recommended for audio playback**
 
 ## Audio Specifications
 **Bot Output (AudioOutput)**:
-- **Codec**: Opus (OpusMusic)
+- **Codec**: Opus (OpusMusic = 5)
 - **Sample Rate**: 48,000 Hz
 - **Channels**: 2 (Stereo)
 - **Bitrate**: Configurable (default 48 kbps)
 - **Format**: Pre-encoded Opus frames
 
 **User Voice (VoiceInput)**:
-- **Codec**: Typically OpusVoice (mono) or OpusMusic (stereo)
+- **Codec**: Typically OpusVoice (4) for mono or OpusMusic (5) for stereo
 - **Sample Rate**: 48,000 Hz
 - **Channels**: 1 (Mono) for voice, 2 (Stereo) for music codec
 - **Format**: Pre-encoded Opus frames

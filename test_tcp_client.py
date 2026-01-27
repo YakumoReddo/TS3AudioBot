@@ -24,6 +24,16 @@ PACKET_VOICE_INPUT = 1
 PACKET_AUDIO_FROM_CLIENT = 2
 PACKET_COMMAND = 3
 
+# Codec types (must match TSLib/TsEnums.cs Codec enum)
+# SpeexNarrowband = 0
+# SpeexWideband = 1
+# SpeexUltraWideband = 2
+# CeltMono = 3
+# OpusVoice = 4  (mono, 48kHz)
+# OpusMusic = 5  (stereo, 48kHz)
+CODEC_OPUS_VOICE = 4
+CODEC_OPUS_MUSIC = 5
+
 # Command types
 CMD_STOP = 0
 CMD_CLEAR_QUEUE = 1

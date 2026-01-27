@@ -16,9 +16,15 @@ import array
 # Packet types for the new protocol
 PACKET_AUDIO_FROM_CLIENT = 2
 
-# Codec types
-CODEC_OPUS_VOICE = 0  # Mono
-CODEC_OPUS_MUSIC = 1  # Stereo
+# Codec types (must match TSLib/TsEnums.cs Codec enum)
+# SpeexNarrowband = 0
+# SpeexWideband = 1
+# SpeexUltraWideband = 2
+# CeltMono = 3
+# OpusVoice = 4  (mono, 48kHz)
+# OpusMusic = 5  (stereo, 48kHz)
+CODEC_OPUS_VOICE = 4  # Mono
+CODEC_OPUS_MUSIC = 5  # Stereo
 
 
 def load_audio_file(file_path, target_sr=48000, stereo=True):
