@@ -7,18 +7,19 @@
 // You should have received a copy of the Open Software License along with this
 // program. If not, see <https://opensource.org/licenses/OSL-3.0>.
 
-using System;
-using System.Collections.Generic;
-using System.IO;
-using System.Linq;
-using System.Net;
-using System.Net.Sockets;
-using System.Threading;
-using System.Threading.Tasks;
-using TS3AudioBot.Config;
-using TSLib;
-using TSLib.Audio;
-using TSLib.Helper;
+	using System;
+	using System.Collections.Generic;
+	using System.IO;
+	using System.Linq;
+	using System.Net;
+	using System.Net.Sockets;
+	using System.Threading;
+	using System.Threading.Tasks;
+	using TS3AudioBot.Config;
+	using TSLib;
+	using TSLib.Audio;
+	using TSLib.Audio.Opus;
+	using TSLib.Helper;
 
 namespace TS3AudioBot.Audio
 {
@@ -30,12 +31,19 @@ namespace TS3AudioBot.Audio
 	{
 		private static readonly NLog.Logger Log = NLog.LogManager.GetCurrentClassLogger();
 		private const int MaxPacketSize = 1024 * 1024; // 1MB maximum packet size
+		private const int PcmBufferSize = 4096 * 4; // 20ms stereo @48kHz
 		private readonly ConfTcpAudioServer config;
 		private TcpListener? listener;
 		private CancellationTokenSource? cancellationTokenSource;
 		private Task? listenerTask;
 		private readonly List<TcpClient> connectedClients = new List<TcpClient>();
 		private readonly object clientLock = new object();
+		private readonly object inputLock = new object();
+		private PassiveMergePipe? inputTarget;
+		private TcpAudioProducer? inputProducer;
+		private OpusDecoder? musicDecoder;
+		private OpusDecoder? voiceDecoder;
+		private readonly byte[] decodeBuffer = new byte[PcmBufferSize];
 		
 		public bool Active
 		{
@@ -51,6 +59,16 @@ namespace TS3AudioBot.Audio
 		public TcpAudioServer(ConfTcpAudioServer config)
 		{
 			this.config = config;
+		}
+
+		public void SetInputTarget(PassiveMergePipe target)
+		{
+			lock (inputLock)
+			{
+				inputTarget = target;
+				if (config.ReceiveAudio)
+					EnsureInputAttached();
+			}
 		}
 
 		public void Start()
@@ -153,9 +171,10 @@ namespace TS3AudioBot.Audio
 						break;
 					}
 
-					// TODO: Inject received audio into the bot's audio pipeline (PassiveMergePipe)
-					// This would require access to the Player/PlayManager to inject audio
-					Log.Debug("Received {0} bytes of audio data from TCP client", length);
+					if (!TryDecode(codecByte, audioBuffer, totalRead, out var decodedSpan))
+						continue;
+
+					EnqueueDecoded(decodedSpan);
 				}
 			}
 			catch (Exception ex)
@@ -245,6 +264,8 @@ namespace TS3AudioBot.Audio
 			Log.Info("Stopping TCP audio server");
 			
 			cancellationTokenSource?.Cancel();
+
+			DetachInput();
 			
 			lock (clientLock)
 			{
@@ -269,6 +290,156 @@ namespace TS3AudioBot.Audio
 		{
 			Stop();
 			cancellationTokenSource?.Dispose();
+			inputProducer?.Dispose();
+			musicDecoder?.Dispose();
+			voiceDecoder?.Dispose();
+		}
+
+		private void EnsureInputAttached()
+		{
+			if (!config.ReceiveAudio)
+				return;
+			if (inputTarget is null)
+				return;
+			if (inputProducer is null)
+				inputProducer = new TcpAudioProducer();
+			inputTarget.Add(inputProducer);
+		}
+
+		private void DetachInput()
+		{
+			lock (inputLock)
+			{
+				if (inputTarget != null && inputProducer != null)
+					inputTarget.Remove(inputProducer);
+			}
+		}
+
+		private bool TryDecode(byte codecByte, byte[] data, int length, out byte[]? decoded)
+		{
+			Log.Warn("Decoding audio packet: {0} bytes", length);
+			decoded = null;
+			try
+			{
+				if (!Enum.IsDefined(typeof(Codec),	codecByte))
+				{
+					Log.Warn("Unsupported codec byte {0} from TCP client", codecByte);
+					return false;
+				}
+			}catch(Exception ex)
+			{
+				Log.Error("error while define {0}", ex.ToString());
+			}
+
+			var codec = (Codec)codecByte;
+			try
+			{
+				switch (codec)
+				{
+				case Codec.OpusMusic:
+					musicDecoder ??= OpusDecoder.Create(48_000, 2);
+					var musicSpan = musicDecoder.Decode(new Span<byte>(data, 0, length), decodeBuffer);
+					Log.Warn("Checking music span > 0");
+					if (musicSpan.Length == 0)
+						return false;
+					Log.Warn("Music span > 0");
+					decoded = musicSpan.ToArray();
+					return true;
+				case Codec.OpusVoice:
+					voiceDecoder ??= OpusDecoder.Create(48_000, 1);
+					var mono = voiceDecoder.Decode(new Span<byte>(data, 0, length), decodeBuffer.AsSpan(0, decodeBuffer.Length / 2));
+					Log.Warn("Checking voice span > 0");
+					if (mono.Length == 0)
+						return false;
+					Log.Warn("Voice span > 0");
+					var monoLength = mono.Length;
+					if (!AudioTools.TryMonoToStereo(decodeBuffer, ref monoLength))
+						return false;
+					Log.Warn("Convert to stereo complete > 0");
+					decoded = new byte[monoLength];
+					Array.Copy(decodeBuffer, 0, decoded, 0, monoLength);
+					return true;
+				default:
+					Log.Warn("Received unsupported codec {0}", codec);
+					return false;
+				}
+			}
+			catch (Exception ex)
+			{
+				Log.Warn(ex, "Failed to decode TCP audio packet");
+				return false;
+			}
+		}
+
+		private void EnqueueDecoded(byte[] decodedBuffer)
+		{
+			var producer = inputProducer;
+			if (producer is null)
+			{
+				lock (inputLock)
+				{
+					EnsureInputAttached();
+					producer = inputProducer;
+				}
+			}
+
+			if (producer is null)
+				return;
+
+			producer.Enqueue(decodedBuffer);
+		}
+
+		private class TcpAudioProducer : IAudioPassiveProducer
+		{
+			private readonly Queue<byte[]> buffers = new Queue<byte[]>();
+			private byte[]? current;
+			private int currentOffset;
+			private readonly object queueLock = new object();
+
+			public void Enqueue(byte[] data)
+			{
+				lock (queueLock)
+				{
+					buffers.Enqueue(data);
+				}
+			}
+
+			public int Read(byte[] buffer, int offset, int length, out Meta? meta)
+			{
+				meta = null;
+				int written = 0;
+
+				lock (queueLock)
+				{
+					while (written < length)
+					{
+						if (current is null || currentOffset >= current.Length)
+						{
+							if (buffers.Count == 0)
+								break;
+							current = buffers.Dequeue();
+							currentOffset = 0;
+						}
+
+						int toCopy = Math.Min(length - written, current.Length - currentOffset);
+						Array.Copy(current, currentOffset, buffer, offset + written, toCopy);
+						currentOffset += toCopy;
+						written += toCopy;
+					}
+				}
+
+				return written;
+			}
+
+			public void Dispose()
+			{
+				lock (queueLock)
+				{
+					buffers.Clear();
+					current = null;
+					currentOffset = 0;
+				}
+			}
 		}
 	}
 }

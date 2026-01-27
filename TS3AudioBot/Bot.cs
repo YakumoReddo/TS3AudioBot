@@ -120,6 +120,8 @@ namespace TS3AudioBot
 			var customTarget = Injector.GetModuleOrThrow<CustomTargetPipe>();
 			var tcpServer = Injector.GetModuleOrThrow<TcpAudioServer>();
 			
+			tcpServer.SetInputTarget(player.MergePipe);
+
 			// Set up audio output to both TeamSpeak and TCP clients using a splitter
 			var splitter = new TSLib.Audio.PassiveSplitterPipe();
 			splitter.Add(customTarget);
