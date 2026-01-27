@@ -29,6 +29,7 @@ namespace TS3AudioBot.Audio
 	public class TcpAudioServer : IAudioPassiveConsumer, IDisposable
 	{
 		private static readonly NLog.Logger Log = NLog.LogManager.GetCurrentClassLogger();
+		private const int MaxPacketSize = 1024 * 1024; // 1MB maximum packet size
 		private readonly ConfTcpAudioServer config;
 		private TcpListener? listener;
 		private CancellationTokenSource? cancellationTokenSource;
@@ -115,32 +116,33 @@ namespace TS3AudioBot.Audio
 			try
 			{
 				using var stream = client.GetStream();
-				var buffer = new byte[4096];
+				var headerBuffer = new byte[5]; // 4 bytes length + 1 byte codec
 				
 				while (!cancellationToken.IsCancellationRequested && client.Connected)
 				{
 					// Read length header (4 bytes)
-					int bytesRead = await stream.ReadAsync(buffer, 0, 4, cancellationToken);
+					int bytesRead = await stream.ReadAsync(headerBuffer, 0, 4, cancellationToken);
 					if (bytesRead != 4) break;
 
-					int length = BitConverter.ToInt32(buffer, 0);
-					if (length <= 0 || length > buffer.Length)
+					int length = BitConverter.ToInt32(headerBuffer, 0);
+					if (length <= 0 || length > MaxPacketSize)
 					{
 						Log.Warn("Invalid packet length received from client: {0}", length);
 						break;
 					}
 
 					// Read codec byte
-					bytesRead = await stream.ReadAsync(buffer, 0, 1, cancellationToken);
+					bytesRead = await stream.ReadAsync(headerBuffer, 0, 1, cancellationToken);
 					if (bytesRead != 1) break;
 					
-					byte codecByte = buffer[0];
+					byte codecByte = headerBuffer[0];
 
-					// Read audio data
+					// Allocate buffer for audio data
+					byte[] audioBuffer = new byte[length];
 					int totalRead = 0;
 					while (totalRead < length)
 					{
-						bytesRead = await stream.ReadAsync(buffer, totalRead, length - totalRead, cancellationToken);
+						bytesRead = await stream.ReadAsync(audioBuffer, totalRead, length - totalRead, cancellationToken);
 						if (bytesRead == 0) break;
 						totalRead += bytesRead;
 					}
@@ -191,7 +193,7 @@ namespace TS3AudioBot.Audio
 			packet[4] = codecByte;
 			data.CopyTo(new Span<byte>(packet, 5, data.Length));
 
-			// Send to all connected clients
+			// Send to all connected clients asynchronously
 			var clientsToRemove = new List<TcpClient>();
 			foreach (var client in clientsSnapshot)
 			{
@@ -200,7 +202,8 @@ namespace TS3AudioBot.Audio
 					if (client.Connected)
 					{
 						var stream = client.GetStream();
-						stream.Write(packet, 0, packet.Length);
+						// Fire and forget - avoid blocking audio thread
+						_ = stream.WriteAsync(packet, 0, packet.Length);
 					}
 					else
 					{

@@ -73,7 +73,7 @@ def main():
         print(f"ERROR: Connection refused. Make sure:")
         print("  1. TS3AudioBot is running")
         print("  2. TCP server is enabled in config (tcp_server.enabled = true)")
-        print("  3. Port {PORT} is correct")
+        print(f"  3. Port {PORT} is correct")
         sys.exit(1)
     except KeyboardInterrupt:
         print("\n\nDisconnecting...")
