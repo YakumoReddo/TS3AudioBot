@@ -315,9 +315,9 @@ namespace TS3AudioBot.Audio
 			}
 		}
 
-		private bool TryDecode(byte codecByte, byte[] data, int length, out Span<byte> decoded)
+		private bool TryDecode(byte codecByte, byte[] data, int length, out byte[]? decoded)
 		{
-			decoded = Span<byte>.Empty;
+			decoded = null;
 
 			if (!Enum.IsDefined(typeof(Codec), (int)codecByte))
 			{
@@ -332,17 +332,21 @@ namespace TS3AudioBot.Audio
 				{
 				case Codec.OpusMusic:
 					musicDecoder ??= OpusDecoder.Create(48_000, 2);
-					decoded = musicDecoder.Decode(new Span<byte>(data, 0, length), decodeBuffer);
-					return decoded.Length > 0;
+					var musicSpan = musicDecoder.Decode(new Span<byte>(data, 0, length), decodeBuffer);
+					if (musicSpan.Length == 0)
+						return false;
+					decoded = musicSpan.ToArray();
+					return true;
 				case Codec.OpusVoice:
 					voiceDecoder ??= OpusDecoder.Create(48_000, 1);
 					var mono = voiceDecoder.Decode(new Span<byte>(data, 0, length), decodeBuffer.AsSpan(0, decodeBuffer.Length / 2));
 					if (mono.Length == 0)
 						return false;
 					var monoLength = mono.Length;
-					if (!AudioTools.TryMonoToStereo(mono, ref monoLength))
+					if (!AudioTools.TryMonoToStereo(decodeBuffer, ref monoLength))
 						return false;
-					decoded = decodeBuffer.AsSpan(0, monoLength);
+					decoded = new byte[monoLength];
+					Array.Copy(decodeBuffer, 0, decoded, 0, monoLength);
 					return true;
 				default:
 					Log.Warn("Received unsupported codec {0}", codec);
@@ -356,7 +360,7 @@ namespace TS3AudioBot.Audio
 			}
 		}
 
-		private void EnqueueDecoded(Span<byte> decodedSpan)
+		private void EnqueueDecoded(byte[] decodedBuffer)
 		{
 			var producer = inputProducer;
 			if (producer is null)
@@ -371,7 +375,7 @@ namespace TS3AudioBot.Audio
 			if (producer is null)
 				return;
 
-			producer.Enqueue(decodedSpan);
+			producer.Enqueue(decodedBuffer);
 		}
 
 		private class TcpAudioProducer : IAudioPassiveProducer
@@ -381,12 +385,11 @@ namespace TS3AudioBot.Audio
 			private int currentOffset;
 			private readonly object queueLock = new object();
 
-			public void Enqueue(ReadOnlySpan<byte> data)
+			public void Enqueue(byte[] data)
 			{
-				var copy = data.ToArray();
 				lock (queueLock)
 				{
-					buffers.Enqueue(copy);
+					buffers.Enqueue(data);
 				}
 			}
 
