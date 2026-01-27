@@ -159,6 +159,15 @@ namespace TS3AudioBot
 					player.Paused = false;
 				});
 			};
+			// When audio is received from TCP client, unpause the player so audio flows through
+			tcpServer.OnAudioReceived += () =>
+			{
+				// Only unpause if no other playback is happening - this allows TCP audio to play
+				if (player.Paused)
+				{
+					player.Paused = false;
+				}
+			};
 
 			Injector.AddModule(ts3FullClient.Book);
 			playManager = Injector.GetModuleOrThrow<PlayManager>();

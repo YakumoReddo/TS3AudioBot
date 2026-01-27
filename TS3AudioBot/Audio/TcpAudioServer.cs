@@ -101,6 +101,12 @@ namespace TS3AudioBot.Audio
 		/// </summary>
 		public event Action? OnResumeRequested;
 
+		/// <summary>
+		/// Event triggered when audio data is received and enqueued from a TCP client.
+		/// This should be used to unpause the audio timer if needed.
+		/// </summary>
+		public event Action? OnAudioReceived;
+
 		public bool Active
 		{
 			get
@@ -593,6 +599,9 @@ namespace TS3AudioBot.Audio
 				return;
 
 			producer.Enqueue(decodedBuffer);
+			
+			// Notify that audio has been received - this allows the player to unpause
+			OnAudioReceived?.Invoke();
 		}
 
 		private class TcpAudioProducer : IAudioPassiveProducer
