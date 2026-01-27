@@ -4,7 +4,7 @@ Advanced TCP Audio Client for TS3AudioBot
 Demonstrates receiving, decoding, and saving audio streams,
 as well as sending commands and audio.
 
-Requires: pip install opuslib numpy
+Requires: pip install opuslib
 """
 
 import socket
@@ -13,6 +13,7 @@ import sys
 import wave
 import threading
 import time
+import array
 
 HOST = 'localhost'
 PORT = 9001
@@ -61,6 +62,25 @@ def send_audio(sock, opus_data, codec=1):
     sock.sendall(packet)
 
 
+def opus_to_wav_pcm(pcm_bytes, channels):
+    """
+    Convert Opus decoded PCM bytes to WAV-compatible interleaved PCM.
+    opuslib returns signed 16-bit samples in native byte order.
+    WAV expects little-endian interleaved samples.
+    """
+    # The decode() returns bytes containing int16 samples
+    # For stereo: samples are interleaved as [L0, R0, L1, R1, ...]
+    # This should already be correct for WAV, just ensure little-endian
+    samples = array.array('h')  # signed 16-bit
+    samples.frombytes(pcm_bytes)
+    
+    # Ensure little-endian for WAV
+    if sys.byteorder == 'big':
+        samples.byteswap()
+    
+    return samples.tobytes()
+
+
 def main():
     print("Advanced TS3AudioBot TCP Audio Client")
     print("=" * 70)
@@ -98,9 +118,10 @@ def main():
         print("Connected successfully!")
         
         # Create Opus decoders
-        music_decoder = opuslib.Decoder(SAMPLE_RATE, 2)  # Stereo for music
-        voice_decoders = {}  # sender_id -> decoder (mono)
-        print(f"Opus decoders initialized")
+        # Stereo decoder for bot audio output (music)
+        music_decoder = opuslib.Decoder(SAMPLE_RATE, CHANNELS)
+        voice_decoders = {}  # sender_id -> decoder
+        print(f"Opus decoder initialized: {SAMPLE_RATE}Hz, {CHANNELS} channels")
         
         # Prepare WAV file for bot audio output
         wav_file = wave.open(OUTPUT_FILE, 'wb')
@@ -170,8 +191,11 @@ def main():
                     # Decode Opus to PCM
                     if codec in [0, 1]:  # OpusVoice or OpusMusic
                         try:
+                            # Decode Opus frame (960 samples = 20ms at 48kHz)
                             pcm_data = music_decoder.decode(audio_data, frame_size=960)
-                            wav_file.writeframes(pcm_data)
+                            # Convert to WAV-compatible format
+                            wav_data = opus_to_wav_pcm(pcm_data, CHANNELS)
+                            wav_file.writeframes(wav_data)
                             decoded_frames += 1
                         except Exception as e:
                             print(f"\n[ERROR] Decode error: {e}")
@@ -192,24 +216,28 @@ def main():
                     speaker_activity[sender_id] = time.time()
                     active_speakers = [sid for sid, t in speaker_activity.items() if time.time() - t < 1.0]
                     
+                    # Determine channels based on codec
+                    # OpusVoice (0) = mono, OpusMusic (1) = stereo
+                    voice_channels = 1 if codec == 0 else 2
+                    
                     # Create decoder and wav file for this speaker if needed
                     if sender_id not in voice_decoders:
-                        voice_decoders[sender_id] = opuslib.Decoder(SAMPLE_RATE, 1)  # Mono for voice
+                        voice_decoders[sender_id] = opuslib.Decoder(SAMPLE_RATE, voice_channels)
                         voice_file_path = f"{VOICE_OUTPUT_PREFIX}{sender_id}.wav"
                         voice_wav = wave.open(voice_file_path, 'wb')
-                        voice_wav.setnchannels(1)  # Mono
+                        voice_wav.setnchannels(voice_channels)
                         voice_wav.setsampwidth(2)
                         voice_wav.setframerate(SAMPLE_RATE)
                         voice_wav_files[sender_id] = voice_wav
-                        print(f"\n[NEW] Recording voice from user {sender_id} to: {voice_file_path}")
+                        print(f"\n[NEW] Recording voice from user {sender_id} to: {voice_file_path} ({voice_channels}ch)")
                     
                     # Decode and save voice
-                    if codec == 0:  # OpusVoice (mono)
-                        try:
-                            pcm_data = voice_decoders[sender_id].decode(audio_data, frame_size=960)
-                            voice_wav_files[sender_id].writeframes(pcm_data)
-                        except Exception as e:
-                            print(f"\n[ERROR] Voice decode error: {e}")
+                    try:
+                        pcm_data = voice_decoders[sender_id].decode(audio_data, frame_size=960)
+                        wav_data = opus_to_wav_pcm(pcm_data, voice_channels)
+                        voice_wav_files[sender_id].writeframes(wav_data)
+                    except Exception as e:
+                        print(f"\n[ERROR] Voice decode error: {e}")
                     
                     if voice_input_count % 25 == 0:
                         print(f"[Voice] Packets: {voice_input_count:5d} | Active speakers: {len(active_speakers)} | IDs: {active_speakers}", end='\r')
