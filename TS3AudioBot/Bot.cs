@@ -65,7 +65,6 @@ namespace TS3AudioBot
 			this.Id = id;
 			this.config = config;
 			this.Injector = injector;
-
 			// Registering config changes
 			config.Language.Changed += async (s, e) =>
 			{
@@ -84,6 +83,7 @@ namespace TS3AudioBot
 			Injector.AddModule(Injector);
 			Injector.AddModule(config.Playlists);
 			Injector.AddModule(config.History);
+			Injector.AddModule(config.TcpServer);
 			Injector.AddModule(Id);
 			builder.RequestModule<PlaylistIO>();
 			builder.RequestModule<PlaylistManager>();
@@ -94,6 +94,7 @@ namespace TS3AudioBot
 			builder.RequestModule<Player>();
 			builder.RequestModule<CustomTargetPipe>();
 			builder.RequestModule<IVoiceTarget, CustomTargetPipe>();
+			builder.RequestModule<TcpAudioServer>();
 			builder.RequestModule<SessionManager>();
 			builder.RequestModule<ResolveContext>();
 			builder.RequestModule<CommandManager>();
@@ -117,7 +118,14 @@ namespace TS3AudioBot
 			player = Injector.GetModuleOrThrow<Player>();
 			Scheduler = Injector.GetModuleOrThrow<DedicatedTaskScheduler>();
 			var customTarget = Injector.GetModuleOrThrow<CustomTargetPipe>();
-			player.SetTarget(customTarget);
+			var tcpServer = Injector.GetModuleOrThrow<TcpAudioServer>();
+			
+			// Set up audio output to both TeamSpeak and TCP clients using a splitter
+			var splitter = new TSLib.Audio.PassiveSplitterPipe();
+			splitter.Add(customTarget);
+			splitter.Add(tcpServer);
+			player.SetTarget(splitter);
+			
 			Injector.AddModule(ts3FullClient.Book);
 			playManager = Injector.GetModuleOrThrow<PlayManager>();
 			targetManager = Injector.GetModuleOrThrow<IVoiceTarget>();
@@ -199,6 +207,9 @@ namespace TS3AudioBot
 
 			DisableIdleTickWorker();
 
+			// Stop TCP audio server
+			Injector.GetModule<TcpAudioServer>()?.Stop();
+
 			Injector.GetModule<PluginManager>()?.StopPlugins(this);
 			Injector.GetModule<PlayManager>()?.Stop();
 			Injector.GetModule<Player>()?.Dispose();
@@ -212,6 +223,9 @@ namespace TS3AudioBot
 		private async Task OnBotConnected(object? sender, EventArgs e)
 		{
 			EnableIdleTickWorker();
+
+			// Start TCP audio server if enabled
+			Injector.GetModule<TcpAudioServer>()?.Start();
 
 			var badges = config.Connect.Badges.Value;
 			if (!string.IsNullOrEmpty(badges))

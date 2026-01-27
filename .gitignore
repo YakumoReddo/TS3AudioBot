@@ -252,3 +252,8 @@ $RECYCLE.BIN/
 
 # Windows shortcuts
 *.lnk
+
+# TCP Audio Test Files
+received_audio.wav
+*.pyc
+__pycache__/

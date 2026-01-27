@@ -153,6 +153,7 @@ namespace TS3AudioBot.Config
 		public ConfPlaylists Playlists { get; } = Create<ConfPlaylists>("playlists");
 		public ConfHistory History { get; } = Create<ConfHistory>("history");
 		public ConfEvents Events { get; } = Create<ConfEvents>("events");
+		public ConfTcpAudioServer TcpServer { get; } = Create<ConfTcpAudioServer>("tcpserver");
 	}
 
 	public class ConfCommands : ConfigTable
@@ -241,6 +242,20 @@ namespace TS3AudioBot.Config
 			" - whisper : Whispers to the channel where the request came from. Other users can join with '!subscribe'.\n" +
 			" - voice : Sends via normal voice to the current channel. '!subscribe' will not work in this mode.\n" +
 			" - !... : A custom command. Use '!xecute (!a) (!b)' for example to execute multiple commands.");
+		public ConfTcpAudioServer TcpServer { get; } = Create<ConfTcpAudioServer>("tcp_server",
+			"TCP server for external audio streaming. Allows external clients (e.g., Python, AI processors) to receive and send audio streams.");
+	}
+
+	public class ConfTcpAudioServer : ConfigTable
+	{
+		public ConfigValue<bool> Enabled { get; } = new ConfigValue<bool>("enabled", false,
+			"Enable the TCP audio streaming server.");
+		public ConfigValue<int> Port { get; } = new ConfigValue<int>("port", 9001,
+			"Port number for the TCP audio server.");
+		public ConfigValue<bool> SendAudio { get; } = new ConfigValue<bool>("send_audio", true,
+			"Allow sending audio stream to connected TCP clients.");
+		public ConfigValue<bool> ReceiveAudio { get; } = new ConfigValue<bool>("receive_audio", true,
+			"Allow receiving audio stream from connected TCP clients.");
 	}
 
 	public class ConfAudioVolume : ConfigTable
