@@ -41,8 +41,13 @@ def main():
     
     print(f"\nConnecting to {HOST}:{PORT}...")
     
+    # Initialize variables to ensure they exist in finally block
+    sock = None
+    wav_file = None
+    
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(1.0)  # Set timeout to allow Ctrl+C to work
         sock.connect((HOST, PORT))
         print("Connected successfully!")
         
@@ -63,58 +68,64 @@ def main():
         decoded_frames = 0
         
         while True:
-            # Read packet header
-            header = b''
-            while len(header) < 5:
-                chunk = sock.recv(5 - len(header))
-                if not chunk:
-                    print("\nConnection closed by server")
+            try:
+                # Read packet header with timeout
+                header = b''
+                while len(header) < 5:
+                    chunk = sock.recv(5 - len(header))
+                    if not chunk:
+                        print("\nConnection closed by server")
+                        return  # Exit cleanly when connection closes
+                    header += chunk
+                
+                if len(header) < 5:
                     break
-                header += chunk
-            
-            if len(header) < 5:
-                break
-            
-            length = struct.unpack('<I', header[:4])[0]
-            codec = header[4]
-            
-            # Read audio data
-            audio_data = b''
-            remaining = length
-            while remaining > 0:
-                chunk = sock.recv(min(remaining, 4096))
-                if not chunk:
-                    print("\nConnection closed while reading data")
+                
+                length = struct.unpack('<I', header[:4])[0]
+                codec = header[4]
+                
+                # Read audio data
+                audio_data = b''
+                remaining = length
+                while remaining > 0:
+                    chunk = sock.recv(min(remaining, 4096))
+                    if not chunk:
+                        print("\nConnection closed while reading data")
+                        return  # Exit cleanly when connection closes
+                    audio_data += chunk
+                    remaining -= len(chunk)
+                
+                if len(audio_data) < length:
                     break
-                audio_data += chunk
-                remaining -= len(chunk)
-            
-            if len(audio_data) < length:
-                break
-            
-            packet_count += 1
-            
-            # Decode Opus to PCM if codec is Opus
-            if codec in [0, 1]:  # OpusVoice or OpusMusic
-                try:
-                    # Decode with frame size 960 (20ms at 48kHz)
-                    pcm_data = decoder.decode(audio_data, frame_size=960)
-                    
-                    # Write to WAV file
-                    wav_file.writeframes(pcm_data)
-                    decoded_frames += 1
-                    
-                    if packet_count % 50 == 0:  # Update every 50 packets (~1 second)
-                        duration = decoded_frames * 0.02  # 20ms per frame
-                        print(f"Packets: {packet_count:5d} | Duration: {duration:6.2f}s | Size: {len(audio_data):5d} bytes", end='\r')
-                        sys.stdout.flush()
+                
+                packet_count += 1
+                
+                # Decode Opus to PCM if codec is Opus
+                if codec in [0, 1]:  # OpusVoice or OpusMusic
+                    try:
+                        # Decode with frame size 960 (20ms at 48kHz)
+                        pcm_data = decoder.decode(audio_data, frame_size=960)
                         
-                except Exception as e:
-                    print(f"\nDecode error: {e}")
+                        # Write to WAV file
+                        wav_file.writeframes(pcm_data)
+                        decoded_frames += 1
+                        
+                        if packet_count % 50 == 0:  # Update every 50 packets (~1 second)
+                            duration = decoded_frames * 0.02  # 20ms per frame
+                            print(f"Packets: {packet_count:5d} | Duration: {duration:6.2f}s | Size: {len(audio_data):5d} bytes", end='\r')
+                            sys.stdout.flush()
+                            
+                    except Exception as e:
+                        print(f"\nDecode error: {e}")
+                        
+                else:
+                    print(f"\nWarning: Unsupported codec {codec}, skipping packet")
                     
-            else:
-                print(f"\nWarning: Unsupported codec {codec}, skipping packet")
-    
+            except socket.timeout:
+                # Timeout is normal, just continue the loop
+                # This allows Ctrl+C to be processed
+                continue
+                    
     except ConnectionRefusedError:
         print(f"ERROR: Connection refused.")
         print("Make sure:")
@@ -133,15 +144,30 @@ def main():
         sys.exit(1)
         
     finally:
-        sock.close()
-        wav_file.close()
+        # Safe cleanup with null checks
+        if sock is not None:
+            try:
+                sock.close()
+                print("Socket closed.")
+            except:
+                pass
         
-        duration = decoded_frames * 0.02
-        print(f"\nSummary:")
-        print(f"  Packets received: {packet_count}")
-        print(f"  Frames decoded: {decoded_frames}")
-        print(f"  Duration: {duration:.2f} seconds")
-        print(f"  Saved to: {OUTPUT_FILE}")
+        if wav_file is not None:
+            try:
+                wav_file.close()
+                print("WAV file closed.")
+            except:
+                pass
+        
+        if packet_count > 0:  # Only show summary if we received some data
+            duration = decoded_frames * 0.02
+            print(f"\nSummary:")
+            print(f"  Packets received: {packet_count}")
+            print(f"  Frames decoded: {decoded_frames}")
+            print(f"  Duration: {duration:.2f} seconds")
+            print(f"  Saved to: {OUTPUT_FILE}")
+        else:
+            print("\nNo audio data received.")
 
 if __name__ == '__main__':
     main()

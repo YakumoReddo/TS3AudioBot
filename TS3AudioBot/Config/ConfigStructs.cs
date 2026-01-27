@@ -153,6 +153,7 @@ namespace TS3AudioBot.Config
 		public ConfPlaylists Playlists { get; } = Create<ConfPlaylists>("playlists");
 		public ConfHistory History { get; } = Create<ConfHistory>("history");
 		public ConfEvents Events { get; } = Create<ConfEvents>("events");
+		public ConfTcpAudioServer TcpServer { get; } = Create<ConfTcpAudioServer>("tcpserver");
 	}
 
 	public class ConfCommands : ConfigTable

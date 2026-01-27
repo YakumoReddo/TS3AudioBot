@@ -65,7 +65,6 @@ namespace TS3AudioBot
 			this.Id = id;
 			this.config = config;
 			this.Injector = injector;
-
 			// Registering config changes
 			config.Language.Changed += async (s, e) =>
 			{
@@ -84,6 +83,7 @@ namespace TS3AudioBot
 			Injector.AddModule(Injector);
 			Injector.AddModule(config.Playlists);
 			Injector.AddModule(config.History);
+			Injector.AddModule(config.TcpServer);
 			Injector.AddModule(Id);
 			builder.RequestModule<PlaylistIO>();
 			builder.RequestModule<PlaylistManager>();
