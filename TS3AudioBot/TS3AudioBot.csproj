@@ -76,6 +76,9 @@
   <ItemGroup>
     <ProjectReference Include="..\TSLib\TSLib.csproj" />
   </ItemGroup>
+  <ItemGroup>
+    <Compile Include="..\TSLib\Audio\Bridge\PcmTcpBridge.cs" Link="Audio\Bridge\PcmTcpBridge.cs" />
+  </ItemGroup>
 
   <ItemGroup>
     <Compile Update="Localization\strings.Designer.cs">

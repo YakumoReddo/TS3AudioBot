@@ -230,6 +230,8 @@ namespace TS3AudioBot.Config
 			"When a new song starts the volume will be trimmed to between min and max.\n" +
 			"When the current volume already is between min and max nothing will happen.\n" +
 			"To completely or partially disable this feature, set min to 0 and/or max to 100.");
+		public ConfAudioBridge Bridge { get; } = Create<ConfAudioBridge>("bridge",
+			"Expose PCM audio over TCP for external processing.");
 		public ConfigValue<float> MaxUserVolume { get; } = new ConfigValue<float>("max_user_volume", 100,
 			"The maximum volume a normal user can request. Only user with the 'ts3ab.admin.volume' permission can request higher volumes.");
 		public ConfigValue<int> Bitrate { get; } = new ConfigValue<int>("bitrate", 48,
@@ -250,6 +252,18 @@ namespace TS3AudioBot.Config
 		public ConfigValue<float> Default { get; } = new ConfigValue<float>("default", 50);
 		public ConfigValue<float> Min { get; } = new ConfigValue<float>("min", 25);
 		public ConfigValue<float> Max { get; } = new ConfigValue<float>("max", 75);
+	}
+
+	public class ConfAudioBridge : ConfigTable
+	{
+		protected override TomlTable.TableTypes TableType => TomlTable.TableTypes.Inline;
+
+		public ConfigValue<bool> Enabled { get; } = new ConfigValue<bool>("enabled", false,
+			"Enable TCP PCM bridge for external clients.");
+		public ConfigValue<int> Port { get; } = new ConfigValue<int>("port", 58920,
+			"TCP port to serve raw PCM (48kHz stereo, 16-bit).");
+		public ConfigValue<int> MaxQueue { get; } = new ConfigValue<int>("max_queue_chunks", 256,
+			"Maximum queued incoming PCM chunks before dropping oldest.");
 	}
 
 

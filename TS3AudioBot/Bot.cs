@@ -117,7 +117,18 @@ namespace TS3AudioBot
 			player = Injector.GetModuleOrThrow<Player>();
 			Scheduler = Injector.GetModuleOrThrow<DedicatedTaskScheduler>();
 			var customTarget = Injector.GetModuleOrThrow<CustomTargetPipe>();
-			player.SetTarget(customTarget);
+			if (config.Audio.Bridge.Enabled)
+			{
+				var splitter = new PassiveSplitterPipe();
+				splitter.Add(customTarget);
+				var bridge = Injector.AddOrGet(new TSLib.Audio.Bridge.PcmTcpBridge(config.Audio.Bridge.Port, config.Audio.Bridge.MaxQueue));
+				splitter.Add(bridge);
+				player.SetTarget(splitter);
+			}
+			else
+			{
+				player.SetTarget(customTarget);
+			}
 			Injector.AddModule(ts3FullClient.Book);
 			playManager = Injector.GetModuleOrThrow<PlayManager>();
 			targetManager = Injector.GetModuleOrThrow<IVoiceTarget>();
