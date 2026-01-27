@@ -7,12 +7,12 @@
 // You should have received a copy of the Open Software License along with this
 // program. If not, see <https://opensource.org/licenses/OSL-3.0>.
 
-using System;
-using System.Collections.Generic;
-using System.IO;
-using System.Linq;
-using System.Net;
-using System.Net.Sockets;
+	using System;
+	using System.Collections.Generic;
+	using System.IO;
+	using System.Linq;
+	using System.Net;
+	using System.Net.Sockets;
 	using System.Threading;
 	using System.Threading.Tasks;
 	using TS3AudioBot.Config;
@@ -340,7 +340,7 @@ namespace TS3AudioBot.Audio
 					if (mono.Length == 0)
 						return false;
 					var monoLength = mono.Length;
-					if (!AudioTools.TryMonoToStereo(decodeBuffer, ref monoLength))
+					if (!AudioTools.TryMonoToStereo(mono, ref monoLength))
 						return false;
 					decoded = decodeBuffer.AsSpan(0, monoLength);
 					return true;
