@@ -317,12 +317,18 @@ namespace TS3AudioBot.Audio
 
 		private bool TryDecode(byte codecByte, byte[] data, int length, out byte[]? decoded)
 		{
+			Log.Warn("Decoding audio packet: {0} bytes", length);
 			decoded = null;
-
-			if (!Enum.IsDefined(typeof(Codec), (int)codecByte))
+			try
 			{
-				Log.Warn("Unsupported codec byte {0} from TCP client", codecByte);
-				return false;
+				if (!Enum.IsDefined(typeof(Codec),	codecByte))
+				{
+					Log.Warn("Unsupported codec byte {0} from TCP client", codecByte);
+					return false;
+				}
+			}catch(Exception ex)
+			{
+				Log.Error("error while define {0}", ex.ToString());
 			}
 
 			var codec = (Codec)codecByte;
@@ -333,18 +339,23 @@ namespace TS3AudioBot.Audio
 				case Codec.OpusMusic:
 					musicDecoder ??= OpusDecoder.Create(48_000, 2);
 					var musicSpan = musicDecoder.Decode(new Span<byte>(data, 0, length), decodeBuffer);
+					Log.Warn("Checking music span > 0");
 					if (musicSpan.Length == 0)
 						return false;
+					Log.Warn("Music span > 0");
 					decoded = musicSpan.ToArray();
 					return true;
 				case Codec.OpusVoice:
 					voiceDecoder ??= OpusDecoder.Create(48_000, 1);
 					var mono = voiceDecoder.Decode(new Span<byte>(data, 0, length), decodeBuffer.AsSpan(0, decodeBuffer.Length / 2));
+					Log.Warn("Checking voice span > 0");
 					if (mono.Length == 0)
 						return false;
+					Log.Warn("Voice span > 0");
 					var monoLength = mono.Length;
 					if (!AudioTools.TryMonoToStereo(decodeBuffer, ref monoLength))
 						return false;
+					Log.Warn("Convert to stereo complete > 0");
 					decoded = new byte[monoLength];
 					Array.Copy(decodeBuffer, 0, decoded, 0, monoLength);
 					return true;
