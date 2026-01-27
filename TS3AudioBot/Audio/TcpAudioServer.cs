@@ -7,25 +7,61 @@
 // You should have received a copy of the Open Software License along with this
 // program. If not, see <https://opensource.org/licenses/OSL-3.0>.
 
-	using System;
-	using System.Collections.Generic;
-	using System.IO;
-	using System.Linq;
-	using System.Net;
-	using System.Net.Sockets;
-	using System.Threading;
-	using System.Threading.Tasks;
-	using TS3AudioBot.Config;
-	using TSLib;
-	using TSLib.Audio;
-	using TSLib.Audio.Opus;
-	using TSLib.Helper;
+using System;
+using System.Buffers.Binary;
+using System.Collections.Generic;
+using System.Net;
+using System.Net.Sockets;
+using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
+using TS3AudioBot.Config;
+using TSLib;
+using TSLib.Audio;
+using TSLib.Audio.Opus;
 
 namespace TS3AudioBot.Audio
 {
 	/// <summary>
+	/// Packet types for the TCP audio protocol.
+	/// </summary>
+	public enum TcpPacketType : byte
+	{
+		/// <summary>Audio output from the bot (what the bot is playing)</summary>
+		AudioOutput = 0,
+		/// <summary>Voice input from TeamSpeak users (users speaking in TS)</summary>
+		VoiceInput = 1,
+		/// <summary>Audio data from TCP client to be played by the bot</summary>
+		AudioFromClient = 2,
+		/// <summary>Command packet (for interrupt, stop, etc.)</summary>
+		Command = 3
+	}
+
+	/// <summary>
+	/// Command types for the TCP protocol.
+	/// </summary>
+	public enum TcpCommandType : byte
+	{
+		/// <summary>Stop current audio playback immediately</summary>
+		StopPlayback = 0,
+		/// <summary>Clear the audio queue</summary>
+		ClearQueue = 1,
+		/// <summary>Pause playback</summary>
+		Pause = 2,
+		/// <summary>Resume playback</summary>
+		Resume = 3
+	}
+
+	/// <summary>
 	/// TCP server for audio streaming. Allows external clients to receive and send audio.
-	/// Protocol format: [Length:4 bytes][Codec:1 byte][Data]
+	/// 
+	/// Protocol format (enhanced):
+	/// - Audio Output (bot playing): [Length:4][PacketType:1=0][Codec:1][Data]
+	/// - Voice Input (TS users):     [Length:4][PacketType:1=1][SenderId:2][Codec:1][Data]
+	/// - Audio From Client:          [Length:4][PacketType:1=2][Codec:1][Data]
+	/// - Command:                    [Length:4][PacketType:1=3][CommandType:1][CommandData...]
+	/// 
+	/// Note: Length field is the length of all data AFTER the length field itself.
 	/// </summary>
 	public class TcpAudioServer : IAudioPassiveConsumer, IDisposable
 	{
@@ -44,7 +80,27 @@ namespace TS3AudioBot.Audio
 		private OpusDecoder? musicDecoder;
 		private OpusDecoder? voiceDecoder;
 		private readonly byte[] decodeBuffer = new byte[PcmBufferSize];
-		
+
+		/// <summary>
+		/// Event triggered when a stop/interrupt command is received from a TCP client.
+		/// </summary>
+		public event Action? OnStopRequested;
+
+		/// <summary>
+		/// Event triggered when a clear queue command is received.
+		/// </summary>
+		public event Action? OnClearQueueRequested;
+
+		/// <summary>
+		/// Event triggered when a pause command is received.
+		/// </summary>
+		public event Action? OnPauseRequested;
+
+		/// <summary>
+		/// Event triggered when a resume command is received.
+		/// </summary>
+		public event Action? OnResumeRequested;
+
 		public bool Active
 		{
 			get
@@ -102,7 +158,7 @@ namespace TS3AudioBot.Audio
 				{
 					var client = await listener.AcceptTcpClientAsync();
 					Log.Info("TCP audio client connected: {0}", client.Client.RemoteEndPoint);
-					
+
 					lock (clientLock)
 					{
 						connectedClients.Add(client);
@@ -134,12 +190,12 @@ namespace TS3AudioBot.Audio
 			try
 			{
 				using var stream = client.GetStream();
-				var headerBuffer = new byte[5]; // 4 bytes length + 1 byte codec
-				
+				var headerBuffer = new byte[8]; // Maximum header size for any packet type
+
 				while (!cancellationToken.IsCancellationRequested && client.Connected)
 				{
 					// Read length header (4 bytes)
-					int bytesRead = await stream.ReadAsync(headerBuffer, 0, 4, cancellationToken);
+					int bytesRead = await ReadExactAsync(stream, headerBuffer, 0, 4, cancellationToken);
 					if (bytesRead != 4) break;
 
 					int length = BitConverter.ToInt32(headerBuffer, 0);
@@ -149,32 +205,28 @@ namespace TS3AudioBot.Audio
 						break;
 					}
 
-					// Read codec byte
-					bytesRead = await stream.ReadAsync(headerBuffer, 0, 1, cancellationToken);
+					// Read packet type (1 byte)
+					bytesRead = await ReadExactAsync(stream, headerBuffer, 0, 1, cancellationToken);
 					if (bytesRead != 1) break;
-					
-					byte codecByte = headerBuffer[0];
 
-					// Allocate buffer for audio data
-					byte[] audioBuffer = new byte[length];
-					int totalRead = 0;
-					while (totalRead < length)
+					var packetType = (TcpPacketType)headerBuffer[0];
+					int remainingLength = length - 1; // Subtract packet type byte
+
+					switch (packetType)
 					{
-						bytesRead = await stream.ReadAsync(audioBuffer, totalRead, length - totalRead, cancellationToken);
-						if (bytesRead == 0) break;
-						totalRead += bytesRead;
+						case TcpPacketType.AudioFromClient:
+							await HandleAudioFromClientAsync(stream, headerBuffer, remainingLength, cancellationToken);
+							break;
+						case TcpPacketType.Command:
+							await HandleCommandAsync(stream, headerBuffer, remainingLength, cancellationToken);
+							break;
+						default:
+							// Skip unknown packet types
+							var skipBuffer = new byte[remainingLength];
+							await ReadExactAsync(stream, skipBuffer, 0, remainingLength, cancellationToken);
+							Log.Warn("Received unknown packet type: {0}", packetType);
+							break;
 					}
-
-					if (totalRead != length)
-					{
-						Log.Warn("Incomplete packet received from client");
-						break;
-					}
-
-					if (!TryDecode(codecByte, audioBuffer, totalRead, out var decodedSpan))
-						continue;
-
-					EnqueueDecoded(decodedSpan);
 				}
 			}
 			catch (Exception ex)
@@ -190,6 +242,110 @@ namespace TS3AudioBot.Audio
 			}
 		}
 
+		private async Task HandleAudioFromClientAsync(NetworkStream stream, byte[] headerBuffer, int remainingLength, CancellationToken cancellationToken)
+		{
+			if (remainingLength < 1)
+			{
+				Log.Warn("Audio packet too short");
+				return;
+			}
+
+			// Read codec byte
+			int bytesRead = await ReadExactAsync(stream, headerBuffer, 0, 1, cancellationToken);
+			if (bytesRead != 1) return;
+
+			byte codecByte = headerBuffer[0];
+			int audioLength = remainingLength - 1;
+
+			if (audioLength <= 0)
+			{
+				Log.Warn("Audio packet has no audio data");
+				return;
+			}
+
+			// Read audio data
+			byte[] audioBuffer = new byte[audioLength];
+			bytesRead = await ReadExactAsync(stream, audioBuffer, 0, audioLength, cancellationToken);
+			if (bytesRead != audioLength)
+			{
+				Log.Warn("Incomplete audio packet received from client");
+				return;
+			}
+
+			if (!TryDecode(codecByte, audioBuffer, audioLength, out var decoded))
+				return;
+
+			EnqueueDecoded(decoded);
+		}
+
+		private async Task HandleCommandAsync(NetworkStream stream, byte[] headerBuffer, int remainingLength, CancellationToken cancellationToken)
+		{
+			if (remainingLength < 1)
+			{
+				Log.Warn("Command packet too short");
+				return;
+			}
+
+			// Read command type
+			int bytesRead = await ReadExactAsync(stream, headerBuffer, 0, 1, cancellationToken);
+			if (bytesRead != 1) return;
+
+			var commandType = (TcpCommandType)headerBuffer[0];
+
+			// Read any additional command data (if present)
+			int commandDataLength = remainingLength - 1;
+			byte[]? commandData = null;
+			if (commandDataLength > 0)
+			{
+				commandData = new byte[commandDataLength];
+				bytesRead = await ReadExactAsync(stream, commandData, 0, commandDataLength, cancellationToken);
+				if (bytesRead != commandDataLength)
+				{
+					Log.Warn("Incomplete command data received");
+					return;
+				}
+			}
+
+			Log.Info("Received command from TCP client: {0}", commandType);
+
+			switch (commandType)
+			{
+				case TcpCommandType.StopPlayback:
+					OnStopRequested?.Invoke();
+					break;
+				case TcpCommandType.ClearQueue:
+					OnClearQueueRequested?.Invoke();
+					ClearInputQueue();
+					break;
+				case TcpCommandType.Pause:
+					OnPauseRequested?.Invoke();
+					break;
+				case TcpCommandType.Resume:
+					OnResumeRequested?.Invoke();
+					break;
+				default:
+					Log.Warn("Unknown command type: {0}", commandType);
+					break;
+			}
+		}
+
+		private static async Task<int> ReadExactAsync(NetworkStream stream, byte[] buffer, int offset, int count, CancellationToken cancellationToken)
+		{
+			int totalRead = 0;
+			while (totalRead < count)
+			{
+				int bytesRead = await stream.ReadAsync(buffer, offset + totalRead, count - totalRead, cancellationToken);
+				if (bytesRead == 0) return totalRead;
+				totalRead += bytesRead;
+			}
+			return totalRead;
+		}
+
+		/// <summary>
+		/// Writes bot audio output (what the bot is playing) to TCP clients.
+		/// This is called from the audio pipeline when the bot plays audio.
+		/// Protocol: [Length:4][PacketType:1=0][Codec:1][Data]
+		/// </summary>
 		public void Write(Span<byte> data, Meta? meta)
 		{
 			if (!config.SendAudio || data.Length == 0)
@@ -205,16 +361,58 @@ namespace TS3AudioBot.Audio
 
 			var codec = meta?.Codec ?? Codec.OpusMusic;
 			byte codecByte = (byte)codec;
-			
-			// Build packet: [Length:4][Codec:1][Data]
-			byte[] packet = new byte[5 + data.Length];
-			BitConverter.GetBytes(data.Length).CopyTo(packet, 0);
-			packet[4] = codecByte;
-			data.CopyTo(new Span<byte>(packet, 5, data.Length));
 
-			// Send to all connected clients asynchronously
+			// Build packet: [Length:4][PacketType:1=0][Codec:1][Data]
+			int packetLength = 1 + 1 + data.Length; // PacketType + Codec + Data
+			byte[] packet = new byte[4 + packetLength];
+			BitConverter.GetBytes(packetLength).CopyTo(packet, 0);
+			packet[4] = (byte)TcpPacketType.AudioOutput;
+			packet[5] = codecByte;
+			data.CopyTo(new Span<byte>(packet, 6, data.Length));
+
+			SendToAllClients(packet, clientsSnapshot);
+		}
+
+		/// <summary>
+		/// Writes incoming voice from TeamSpeak users to TCP clients.
+		/// This allows external processors (like Python AI) to receive user voice.
+		/// Protocol: [Length:4][PacketType:1=1][SenderId:2][Codec:1][Data]
+		/// </summary>
+		/// <param name="data">The encoded audio data</param>
+		/// <param name="meta">Audio metadata including sender information</param>
+		public void WriteVoiceInput(Span<byte> data, Meta? meta)
+		{
+			if (!config.SendAudio || data.Length == 0)
+				return;
+
+			List<TcpClient> clientsSnapshot;
+			lock (clientLock)
+			{
+				if (connectedClients.Count == 0)
+					return;
+				clientsSnapshot = new List<TcpClient>(connectedClients);
+			}
+
+			var codec = meta?.Codec ?? Codec.OpusVoice;
+			byte codecByte = (byte)codec;
+			ushort senderId = meta?.In.Sender.Value ?? 0;
+
+			// Build packet: [Length:4][PacketType:1=1][SenderId:2][Codec:1][Data]
+			int packetLength = 1 + 2 + 1 + data.Length; // PacketType + SenderId + Codec + Data
+			byte[] packet = new byte[4 + packetLength];
+			BitConverter.GetBytes(packetLength).CopyTo(packet, 0);
+			packet[4] = (byte)TcpPacketType.VoiceInput;
+			BinaryPrimitives.WriteUInt16LittleEndian(packet.AsSpan(5, 2), senderId);
+			packet[7] = codecByte;
+			data.CopyTo(new Span<byte>(packet, 8, data.Length));
+
+			SendToAllClients(packet, clientsSnapshot);
+		}
+
+		private void SendToAllClients(byte[] packet, List<TcpClient> clients)
+		{
 			var clientsToRemove = new List<TcpClient>();
-			foreach (var client in clientsSnapshot)
+			foreach (var client in clients)
 			{
 				try
 				{
@@ -262,11 +460,11 @@ namespace TS3AudioBot.Audio
 		public void Stop()
 		{
 			Log.Info("Stopping TCP audio server");
-			
+
 			cancellationTokenSource?.Cancel();
 
 			DetachInput();
-			
+
 			lock (clientLock)
 			{
 				foreach (var client in connectedClients)
@@ -315,20 +513,30 @@ namespace TS3AudioBot.Audio
 			}
 		}
 
+		/// <summary>
+		/// Clears the input audio queue (for interrupt functionality).
+		/// </summary>
+		public void ClearInputQueue()
+		{
+			inputProducer?.Clear();
+		}
+
 		private bool TryDecode(byte codecByte, byte[] data, int length, out byte[]? decoded)
 		{
-			Log.Warn("Decoding audio packet: {0} bytes", length);
+			Log.Debug("Decoding audio packet: {0} bytes, codec: {1}", length, codecByte);
 			decoded = null;
 			try
 			{
-				if (!Enum.IsDefined(typeof(Codec),	codecByte))
+				if (!Enum.IsDefined(typeof(Codec), codecByte))
 				{
 					Log.Warn("Unsupported codec byte {0} from TCP client", codecByte);
 					return false;
 				}
-			}catch(Exception ex)
+			}
+			catch (Exception ex)
 			{
-				Log.Error("error while define {0}", ex.ToString());
+				Log.Error("Error while validating codec: {0}", ex.ToString());
+				return false;
 			}
 
 			var codec = (Codec)codecByte;
@@ -336,32 +544,27 @@ namespace TS3AudioBot.Audio
 			{
 				switch (codec)
 				{
-				case Codec.OpusMusic:
-					musicDecoder ??= OpusDecoder.Create(48_000, 2);
-					var musicSpan = musicDecoder.Decode(new Span<byte>(data, 0, length), decodeBuffer);
-					Log.Warn("Checking music span > 0");
-					if (musicSpan.Length == 0)
+					case Codec.OpusMusic:
+						musicDecoder ??= OpusDecoder.Create(48_000, 2);
+						var musicSpan = musicDecoder.Decode(new Span<byte>(data, 0, length), decodeBuffer);
+						if (musicSpan.Length == 0)
+							return false;
+						decoded = musicSpan.ToArray();
+						return true;
+					case Codec.OpusVoice:
+						voiceDecoder ??= OpusDecoder.Create(48_000, 1);
+						var mono = voiceDecoder.Decode(new Span<byte>(data, 0, length), decodeBuffer.AsSpan(0, decodeBuffer.Length / 2));
+						if (mono.Length == 0)
+							return false;
+						var monoLength = mono.Length;
+						if (!AudioTools.TryMonoToStereo(decodeBuffer, ref monoLength))
+							return false;
+						decoded = new byte[monoLength];
+						Array.Copy(decodeBuffer, 0, decoded, 0, monoLength);
+						return true;
+					default:
+						Log.Warn("Received unsupported codec {0}", codec);
 						return false;
-					Log.Warn("Music span > 0");
-					decoded = musicSpan.ToArray();
-					return true;
-				case Codec.OpusVoice:
-					voiceDecoder ??= OpusDecoder.Create(48_000, 1);
-					var mono = voiceDecoder.Decode(new Span<byte>(data, 0, length), decodeBuffer.AsSpan(0, decodeBuffer.Length / 2));
-					Log.Warn("Checking voice span > 0");
-					if (mono.Length == 0)
-						return false;
-					Log.Warn("Voice span > 0");
-					var monoLength = mono.Length;
-					if (!AudioTools.TryMonoToStereo(decodeBuffer, ref monoLength))
-						return false;
-					Log.Warn("Convert to stereo complete > 0");
-					decoded = new byte[monoLength];
-					Array.Copy(decodeBuffer, 0, decoded, 0, monoLength);
-					return true;
-				default:
-					Log.Warn("Received unsupported codec {0}", codec);
-					return false;
 				}
 			}
 			catch (Exception ex)
@@ -371,8 +574,11 @@ namespace TS3AudioBot.Audio
 			}
 		}
 
-		private void EnqueueDecoded(byte[] decodedBuffer)
+		private void EnqueueDecoded(byte[]? decodedBuffer)
 		{
+			if (decodedBuffer is null)
+				return;
+
 			var producer = inputProducer;
 			if (producer is null)
 			{
@@ -401,6 +607,16 @@ namespace TS3AudioBot.Audio
 				lock (queueLock)
 				{
 					buffers.Enqueue(data);
+				}
+			}
+
+			public void Clear()
+			{
+				lock (queueLock)
+				{
+					buffers.Clear();
+					current = null;
+					currentOffset = 0;
 				}
 			}
 
@@ -433,12 +649,7 @@ namespace TS3AudioBot.Audio
 
 			public void Dispose()
 			{
-				lock (queueLock)
-				{
-					buffers.Clear();
-					current = null;
-					currentOffset = 0;
-				}
+				Clear();
 			}
 		}
 	}

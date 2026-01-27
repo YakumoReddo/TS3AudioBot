@@ -127,7 +127,39 @@ namespace TS3AudioBot
 			splitter.Add(customTarget);
 			splitter.Add(tcpServer);
 			player.SetTarget(splitter);
-			
+
+			// Set up voice input forwarding: capture voice from TS users and forward to TCP clients
+			// This uses the AudioPacketReader to parse the raw voice packets first
+			var voiceInputForwarder = new VoiceInputForwarder(tcpServer);
+			var audioPacketReader = new TSLib.Audio.AudioPacketReader { OutStream = voiceInputForwarder };
+			ts3FullClient.OutStream = audioPacketReader;
+
+			// Wire up TCP command events for interrupt/stop functionality
+			tcpServer.OnStopRequested += () =>
+			{
+				Scheduler.InvokeAsync(async () =>
+				{
+					Log.Info("TCP client requested stop playback");
+					playManager?.Stop();
+				});
+			};
+			tcpServer.OnPauseRequested += () =>
+			{
+				Scheduler.InvokeAsync(async () =>
+				{
+					Log.Info("TCP client requested pause");
+					player.Paused = true;
+				});
+			};
+			tcpServer.OnResumeRequested += () =>
+			{
+				Scheduler.InvokeAsync(async () =>
+				{
+					Log.Info("TCP client requested resume");
+					player.Paused = false;
+				});
+			};
+
 			Injector.AddModule(ts3FullClient.Book);
 			playManager = Injector.GetModuleOrThrow<PlayManager>();
 			targetManager = Injector.GetModuleOrThrow<IVoiceTarget>();
