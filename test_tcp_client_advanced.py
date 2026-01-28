@@ -1,30 +1,105 @@
 #!/usr/bin/env python3
 """
 Advanced TCP Audio Client for TS3AudioBot
-Demonstrates receiving, decoding, and saving audio streams
-Requires: pip install opuslib numpy
+Demonstrates receiving, decoding, and saving audio streams,
+as well as sending commands and audio.
+
+Requires: pip install opuslib
 """
 
 import socket
 import struct
 import sys
 import wave
-import numpy as np
+import threading
+import time
+import array
 
 HOST = 'localhost'
 PORT = 9001
 SAMPLE_RATE = 48000
 CHANNELS = 2
 OUTPUT_FILE = 'received_audio.wav'
+VOICE_OUTPUT_PREFIX = 'voice_user_'
+
+# Packet types
+PACKET_AUDIO_OUTPUT = 0
+PACKET_VOICE_INPUT = 1
+PACKET_AUDIO_FROM_CLIENT = 2
+PACKET_COMMAND = 3
+
+# Codec types (must match TSLib/TsEnums.cs Codec enum)
+# SpeexNarrowband = 0
+# SpeexWideband = 1
+# SpeexUltraWideband = 2
+# CeltMono = 3
+# OpusVoice = 4  (mono, 48kHz)
+# OpusMusic = 5  (stereo, 48kHz)
+CODEC_OPUS_VOICE = 4
+CODEC_OPUS_MUSIC = 5
+
+# Command types
+CMD_STOP = 0
+CMD_CLEAR_QUEUE = 1
+CMD_PAUSE = 2
+CMD_RESUME = 3
+
+
+def recv_exact(sock, count):
+    """Receive exactly count bytes."""
+    data = b''
+    while len(data) < count:
+        chunk = sock.recv(count - len(data))
+        if not chunk:
+            return None
+        data += chunk
+    return data
+
+
+def send_command(sock, command_type):
+    """Send a control command to the bot."""
+    # [Length:4][PacketType:1=3][CommandType:1]
+    length = 2
+    packet = struct.pack('<I', length) + bytes([PACKET_COMMAND, command_type])
+    sock.sendall(packet)
+
+
+def send_audio(sock, opus_data, codec=CODEC_OPUS_MUSIC):
+    """Send audio data to be played by the bot."""
+    # [Length:4][PacketType:1=2][Codec:1][AudioData:N]
+    length = 1 + 1 + len(opus_data)
+    packet = struct.pack('<I', length) + bytes([PACKET_AUDIO_FROM_CLIENT, codec]) + opus_data
+    sock.sendall(packet)
+
+
+def opus_to_wav_pcm(pcm_bytes, channels):
+    """
+    Convert Opus decoded PCM bytes to WAV-compatible interleaved PCM.
+    opuslib returns signed 16-bit samples in native byte order.
+    WAV expects little-endian interleaved samples.
+    """
+    # The decode() returns bytes containing int16 samples
+    # For stereo: samples are interleaved as [L0, R0, L1, R1, ...]
+    # This should already be correct for WAV, just ensure little-endian
+    samples = array.array('h')  # signed 16-bit
+    samples.frombytes(pcm_bytes)
+    
+    # Ensure little-endian for WAV
+    if sys.byteorder == 'big':
+        samples.byteswap()
+    
+    return samples.tobytes()
+
 
 def main():
     print("Advanced TS3AudioBot TCP Audio Client")
-    print("=" * 60)
+    print("=" * 70)
     print("This client will:")
     print("  1. Connect to the bot's TCP audio server")
-    print("  2. Receive Opus-encoded audio packets")
+    print("  2. Receive Opus-encoded audio packets (bot output + user voice)")
     print("  3. Decode them to PCM")
-    print("  4. Save to WAV file")
+    print("  4. Save bot audio to WAV file")
+    print("  5. Track and save individual user voice to separate files")
     print("")
     
     # Try to import opuslib
@@ -41,9 +116,10 @@ def main():
     
     print(f"\nConnecting to {HOST}:{PORT}...")
     
-    # Initialize variables to ensure they exist in finally block
+    # Initialize variables
     sock = None
     wav_file = None
+    voice_wav_files = {}  # sender_id -> wav file
     
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -51,79 +127,133 @@ def main():
         sock.connect((HOST, PORT))
         print("Connected successfully!")
         
-        # Create Opus decoder
-        decoder = opuslib.Decoder(SAMPLE_RATE, CHANNELS)
-        print(f"Opus decoder initialized (48kHz, stereo)")
+        # Create Opus decoders
+        # Stereo decoder for bot audio output (music)
+        music_decoder = opuslib.Decoder(SAMPLE_RATE, CHANNELS)
+        voice_decoders = {}  # sender_id -> decoder
+        print(f"Opus decoder initialized: {SAMPLE_RATE}Hz, {CHANNELS} channels")
         
-        # Prepare WAV file for output
+        # Prepare WAV file for bot audio output
         wav_file = wave.open(OUTPUT_FILE, 'wb')
         wav_file.setnchannels(CHANNELS)
         wav_file.setsampwidth(2)  # 16-bit samples
         wav_file.setframerate(SAMPLE_RATE)
         
-        print(f"Recording to: {OUTPUT_FILE}")
+        print(f"Recording bot audio to: {OUTPUT_FILE}")
         print("Press Ctrl+C to stop...\n")
+        print("Commands: Type 'stop', 'pause', 'resume', 'clear' and press Enter")
+        print("-" * 70)
         
-        packet_count = 0
+        audio_output_count = 0
+        voice_input_count = 0
         decoded_frames = 0
+        speaker_activity = {}
+        
+        # Start command input thread
+        def command_input():
+            while True:
+                try:
+                    cmd = input().strip().lower()
+                    if cmd == 'stop':
+                        send_command(sock, CMD_STOP)
+                        print("[CMD] Sent stop command")
+                    elif cmd == 'pause':
+                        send_command(sock, CMD_PAUSE)
+                        print("[CMD] Sent pause command")
+                    elif cmd == 'resume':
+                        send_command(sock, CMD_RESUME)
+                        print("[CMD] Sent resume command")
+                    elif cmd == 'clear':
+                        send_command(sock, CMD_CLEAR_QUEUE)
+                        print("[CMD] Sent clear queue command")
+                    elif cmd:
+                        print(f"[CMD] Unknown command: {cmd}")
+                except:
+                    break
+        
+        cmd_thread = threading.Thread(target=command_input, daemon=True)
+        cmd_thread.start()
         
         while True:
             try:
-                # Read packet header with timeout
-                header = b''
-                while len(header) < 5:
-                    chunk = sock.recv(5 - len(header))
-                    if not chunk:
-                        print("\nConnection closed by server")
-                        return  # Exit cleanly when connection closes
-                    header += chunk
-                
-                if len(header) < 5:
+                # Read length header
+                header = recv_exact(sock, 4)
+                if not header:
+                    print("\nConnection closed by server")
                     break
                 
-                length = struct.unpack('<I', header[:4])[0]
-                codec = header[4]
+                length = struct.unpack('<I', header)[0]
                 
-                # Read audio data
-                audio_data = b''
-                remaining = length
-                while remaining > 0:
-                    chunk = sock.recv(min(remaining, 4096))
-                    if not chunk:
-                        print("\nConnection closed while reading data")
-                        return  # Exit cleanly when connection closes
-                    audio_data += chunk
-                    remaining -= len(chunk)
-                
-                if len(audio_data) < length:
+                # Read packet data
+                data = recv_exact(sock, length)
+                if not data or len(data) < length:
+                    print("\nConnection closed while reading data")
                     break
                 
-                packet_count += 1
+                packet_type = data[0]
                 
-                # Decode Opus to PCM if codec is Opus
-                if codec in [0, 1]:  # OpusVoice or OpusMusic
-                    try:
-                        # Decode with frame size 960 (20ms at 48kHz)
-                        pcm_data = decoder.decode(audio_data, frame_size=960)
-                        
-                        # Write to WAV file
-                        wav_file.writeframes(pcm_data)
-                        decoded_frames += 1
-                        
-                        if packet_count % 50 == 0:  # Update every 50 packets (~1 second)
-                            duration = decoded_frames * 0.02  # 20ms per frame
-                            print(f"Packets: {packet_count:5d} | Duration: {duration:6.2f}s | Size: {len(audio_data):5d} bytes", end='\r')
-                            sys.stdout.flush()
-                            
-                    except Exception as e:
-                        print(f"\nDecode error: {e}")
-                        
-                else:
-                    print(f"\nWarning: Unsupported codec {codec}, skipping packet")
+                if packet_type == PACKET_AUDIO_OUTPUT:
+                    # [PacketType:1][Codec:1][AudioData:N]
+                    codec = data[1]
+                    audio_data = data[2:]
+                    audio_output_count += 1
                     
+                    # Decode Opus to PCM
+                    if codec in [CODEC_OPUS_VOICE, CODEC_OPUS_MUSIC]:  # OpusVoice or OpusMusic
+                        try:
+                            # Decode Opus frame (960 samples = 20ms at 48kHz)
+                            pcm_data = music_decoder.decode(audio_data, frame_size=960)
+                            # Convert to WAV-compatible format
+                            wav_data = opus_to_wav_pcm(pcm_data, CHANNELS)
+                            wav_file.writeframes(wav_data)
+                            decoded_frames += 1
+                        except Exception as e:
+                            print(f"\n[ERROR] Decode error: {e}")
+                    
+                    if audio_output_count % 50 == 0:
+                        duration = decoded_frames * 0.02
+                        print(f"[Audio] Packets: {audio_output_count:5d} | Duration: {duration:6.2f}s", end='\r')
+                        sys.stdout.flush()
+                
+                elif packet_type == PACKET_VOICE_INPUT:
+                    # [PacketType:1][SenderId:2][Codec:1][AudioData:N]
+                    sender_id = struct.unpack('<H', data[1:3])[0]
+                    codec = data[3]
+                    audio_data = data[4:]
+                    voice_input_count += 1
+                    
+                    # Track speaker activity
+                    speaker_activity[sender_id] = time.time()
+                    active_speakers = [sid for sid, t in speaker_activity.items() if time.time() - t < 1.0]
+                    
+                    # Determine channels based on codec
+                    # OpusVoice (4) = mono, OpusMusic (5) = stereo
+                    voice_channels = 1 if codec == CODEC_OPUS_VOICE else 2
+                    
+                    # Create decoder and wav file for this speaker if needed
+                    if sender_id not in voice_decoders:
+                        voice_decoders[sender_id] = opuslib.Decoder(SAMPLE_RATE, voice_channels)
+                        voice_file_path = f"{VOICE_OUTPUT_PREFIX}{sender_id}.wav"
+                        voice_wav = wave.open(voice_file_path, 'wb')
+                        voice_wav.setnchannels(voice_channels)
+                        voice_wav.setsampwidth(2)
+                        voice_wav.setframerate(SAMPLE_RATE)
+                        voice_wav_files[sender_id] = voice_wav
+                        print(f"\n[NEW] Recording voice from user {sender_id} to: {voice_file_path} ({voice_channels}ch)")
+                    
+                    # Decode and save voice
+                    try:
+                        pcm_data = voice_decoders[sender_id].decode(audio_data, frame_size=960)
+                        wav_data = opus_to_wav_pcm(pcm_data, voice_channels)
+                        voice_wav_files[sender_id].writeframes(wav_data)
+                    except Exception as e:
+                        print(f"\n[ERROR] Voice decode error: {e}")
+                    
+                    if voice_input_count % 25 == 0:
+                        print(f"[Voice] Packets: {voice_input_count:5d} | Active speakers: {len(active_speakers)} | IDs: {active_speakers}", end='\r')
+                        sys.stdout.flush()
+                        
             except socket.timeout:
-                # Timeout is normal, just continue the loop
-                # This allows Ctrl+C to be processed
                 continue
                     
     except ConnectionRefusedError:
@@ -131,7 +261,6 @@ def main():
         print("Make sure:")
         print("  1. TS3AudioBot is running and connected to TeamSpeak")
         print("  2. TCP server is enabled: tcp_server.enabled = true")
-        print("  3. Bot is playing audio")
         sys.exit(1)
         
     except KeyboardInterrupt:
@@ -144,7 +273,7 @@ def main():
         sys.exit(1)
         
     finally:
-        # Safe cleanup with null checks
+        # Safe cleanup
         if sock is not None:
             try:
                 sock.close()
@@ -155,19 +284,31 @@ def main():
         if wav_file is not None:
             try:
                 wav_file.close()
-                print("WAV file closed.")
+                print("Bot audio WAV file closed.")
             except:
                 pass
         
-        if packet_count > 0:  # Only show summary if we received some data
+        for sender_id, voice_wav in voice_wav_files.items():
+            try:
+                voice_wav.close()
+                print(f"Voice WAV file for user {sender_id} closed.")
+            except:
+                pass
+        
+        # Summary
+        if audio_output_count > 0 or voice_input_count > 0:
             duration = decoded_frames * 0.02
             print(f"\nSummary:")
-            print(f"  Packets received: {packet_count}")
-            print(f"  Frames decoded: {decoded_frames}")
-            print(f"  Duration: {duration:.2f} seconds")
-            print(f"  Saved to: {OUTPUT_FILE}")
+            print(f"  Audio output packets: {audio_output_count}")
+            print(f"  Voice input packets:  {voice_input_count}")
+            print(f"  Decoded frames:       {decoded_frames}")
+            print(f"  Bot audio duration:   {duration:.2f} seconds")
+            print(f"  Saved to:             {OUTPUT_FILE}")
+            if voice_wav_files:
+                print(f"  Voice files:          {list(voice_wav_files.keys())}")
         else:
             print("\nNo audio data received.")
+
 
 if __name__ == '__main__':
     main()

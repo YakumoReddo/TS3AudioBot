@@ -1,7 +1,17 @@
 # TCP Audio Streaming Protocol Documentation
 
 ## Overview
-TS3AudioBot now supports a TCP-based audio streaming service that allows external clients (e.g., Python scripts, AI processors) to receive and send audio streams.
+TS3AudioBot supports a TCP-based audio streaming service that allows external clients (e.g., Python scripts, AI processors) to:
+1. **Receive bot audio output** - What the bot is currently playing (music, TTS, etc.)
+2. **Receive voice input from TS users** - Audio from users speaking in TeamSpeak
+3. **Send audio to the bot** - Stream audio that the bot will play in TeamSpeak
+4. **Control playback** - Stop, pause, resume, and clear audio queue
+
+This enables powerful AI integration scenarios like:
+- Real-time speech-to-text using Whisper
+- LLM-based command processing
+- Text-to-speech response generation
+- Smart music/content interruption
 
 ## Configuration
 Enable the TCP audio server by adding the following to your bot configuration file (`bots/<botname>.toml`):
@@ -22,36 +32,262 @@ Configuration options:
 
 ## Protocol Format
 
-### Packet Structure
-All packets follow this binary format:
+### Packet Types
+| Type | Value | Description |
+|------|-------|-------------|
+| AudioOutput | 0 | Bot's audio output (music, TTS being played) |
+| VoiceInput | 1 | Voice from TeamSpeak users speaking |
+| AudioFromClient | 2 | Audio sent by TCP client to play on TS |
+| Command | 3 | Control commands (stop, pause, etc.) |
+
+### Packet Structures
+
+#### 1. Audio Output (Bot -> Client)
+What the bot is currently playing (music, TTS, etc.).
 
 ```
-[Length: 4 bytes (int32, little-endian)] [Codec: 1 byte] [Audio Data: N bytes]
+[Length: 4 bytes (int32, LE)] [PacketType: 1 byte = 0] [Codec: 1 byte] [Audio Data: N bytes]
 ```
 
-- **Length**: 4-byte integer representing the length of audio data (not including header)
-- **Codec**: 1-byte codec identifier (see Codec Types below)
-- **Audio Data**: Raw encoded audio data
+- **Length**: Total length after this field (PacketType + Codec + AudioData)
+- **PacketType**: 0 (AudioOutput)
+- **Codec**: See Codec Types below
+- **Audio Data**: Opus-encoded audio frames
+
+#### 2. Voice Input (Bot -> Client)
+Voice from users speaking in TeamSpeak. Includes sender identification.
+
+```
+[Length: 4 bytes (int32, LE)] [PacketType: 1 byte = 1] [SenderId: 2 bytes (uint16, LE)] [Codec: 1 byte] [Audio Data: N bytes]
+```
+
+- **Length**: Total length after this field
+- **PacketType**: 1 (VoiceInput)
+- **SenderId**: TeamSpeak ClientId of the speaker (allows identifying who is speaking)
+- **Codec**: See Codec Types below
+- **Audio Data**: Opus-encoded audio frames
+
+**Important**: When multiple users speak simultaneously, you receive **separate packets for each user**. Each packet contains a single user's voice with their unique SenderId. Your client should:
+- Track packets by SenderId to handle multiple simultaneous speakers
+- Potentially mix audio from multiple users if needed
+- Use SenderId to associate voice with specific users
+
+#### 3. Audio From Client (Client -> Bot)
+Audio data to be played by the bot in TeamSpeak.
+
+```
+[Length: 4 bytes (int32, LE)] [PacketType: 1 byte = 2] [Codec: 1 byte] [Audio Data: N bytes]
+```
+
+- **Length**: Total length after this field
+- **PacketType**: 2 (AudioFromClient)
+- **Codec**: See Codec Types below
+- **Audio Data**: Opus-encoded audio frames
+
+#### 4. Command (Client -> Bot)
+Control commands for playback.
+
+```
+[Length: 4 bytes (int32, LE)] [PacketType: 1 byte = 3] [CommandType: 1 byte] [CommandData: optional]
+```
+
+Command Types:
+| CommandType | Value | Description |
+|-------------|-------|-------------|
+| StopPlayback | 0 | Stop current playback immediately |
+| ClearQueue | 1 | Clear pending audio in the queue |
+| Pause | 2 | Pause playback |
+| Resume | 3 | Resume playback |
 
 ### Codec Types
-- `0` = OpusVoice (Opus codec, voice quality)
-- `1` = OpusMusic (Opus codec, music quality) - **Default for bot output**
-- `2` = Speex (legacy)
-- `3` = Celt (legacy)
-
-Most modern use cases should use OpusMusic (codec byte = `1`).
+The codec types match the TeamSpeak Codec enum values:
+- `0` = SpeexNarrowband (mono, 8kHz) - legacy
+- `1` = SpeexWideband (mono, 16kHz) - legacy
+- `2` = SpeexUltraWideband (mono, 32kHz) - legacy
+- `3` = CeltMono (mono, 48kHz) - legacy
+- `4` = OpusVoice (mono, 48kHz, optimized for voice)
+- `5` = OpusMusic (stereo, 48kHz, optimized for music) - **Recommended for audio playback**
 
 ## Audio Specifications
-When the bot sends audio:
-- **Codec**: Opus (OpusMusic)
+**Bot Output (AudioOutput)**:
+- **Codec**: Opus (OpusMusic = 5)
 - **Sample Rate**: 48,000 Hz
 - **Channels**: 2 (Stereo)
 - **Bitrate**: Configurable (default 48 kbps)
 - **Format**: Pre-encoded Opus frames
 
-## Python Client Example
+**User Voice (VoiceInput)**:
+- **Codec**: Typically OpusVoice (4) for mono or OpusMusic (5) for stereo
+- **Sample Rate**: 48,000 Hz
+- **Channels**: 1 (Mono) for voice, 2 (Stereo) for music codec
+- **Format**: Pre-encoded Opus frames
 
-### Receiving Audio Stream
+## Python Client Examples
+
+### Complete AI Integration Example
+```python
+import socket
+import struct
+import threading
+import queue
+
+HOST = 'localhost'
+PORT = 9001
+
+# Packet types
+PACKET_AUDIO_OUTPUT = 0
+PACKET_VOICE_INPUT = 1
+PACKET_AUDIO_FROM_CLIENT = 2
+PACKET_COMMAND = 3
+
+# Command types
+CMD_STOP = 0
+CMD_CLEAR_QUEUE = 1
+CMD_PAUSE = 2
+CMD_RESUME = 3
+
+class TS3AudioClient:
+    def __init__(self, host, port):
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.sock.connect((host, port))
+        self.voice_queues = {}  # SenderId -> queue of audio packets
+        self.running = True
+        
+    def receive_packets(self, callback):
+        """Receive and process packets from the bot."""
+        while self.running:
+            # Read header
+            header = self._recv_exact(4)
+            if not header:
+                break
+            length = struct.unpack('<I', header)[0]
+            
+            # Read packet data
+            data = self._recv_exact(length)
+            if not data:
+                break
+                
+            packet_type = data[0]
+            
+            if packet_type == PACKET_AUDIO_OUTPUT:
+                # Bot audio output: [PacketType:1][Codec:1][AudioData:N]
+                codec = data[1]
+                audio_data = data[2:]
+                callback('audio_output', {'codec': codec, 'data': audio_data})
+                
+            elif packet_type == PACKET_VOICE_INPUT:
+                # Voice input: [PacketType:1][SenderId:2][Codec:1][AudioData:N]
+                sender_id = struct.unpack('<H', data[1:3])[0]
+                codec = data[3]
+                audio_data = data[4:]
+                callback('voice_input', {
+                    'sender_id': sender_id,
+                    'codec': codec,
+                    'data': audio_data
+                })
+    
+    def send_audio(self, opus_data, codec=1):
+        """Send audio to be played by the bot."""
+        # [Length:4][PacketType:1=2][Codec:1][AudioData:N]
+        length = 1 + 1 + len(opus_data)
+        packet = struct.pack('<I', length) + bytes([PACKET_AUDIO_FROM_CLIENT, codec]) + opus_data
+        self.sock.sendall(packet)
+    
+    def send_command(self, command_type):
+        """Send a control command."""
+        # [Length:4][PacketType:1=3][CommandType:1]
+        length = 2
+        packet = struct.pack('<I', length) + bytes([PACKET_COMMAND, command_type])
+        self.sock.sendall(packet)
+    
+    def stop_playback(self):
+        """Stop current playback (interrupt)."""
+        self.send_command(CMD_STOP)
+    
+    def pause(self):
+        """Pause playback."""
+        self.send_command(CMD_PAUSE)
+    
+    def resume(self):
+        """Resume playback."""
+        self.send_command(CMD_RESUME)
+    
+    def clear_queue(self):
+        """Clear pending audio queue."""
+        self.send_command(CMD_CLEAR_QUEUE)
+    
+    def _recv_exact(self, count):
+        """Receive exactly count bytes."""
+        data = b''
+        while len(data) < count:
+            chunk = self.sock.recv(count - len(data))
+            if not chunk:
+                return None
+            data += chunk
+        return data
+    
+    def close(self):
+        self.running = False
+        self.sock.close()
+
+
+# Example: AI Voice Assistant Integration
+def main():
+    client = TS3AudioClient(HOST, PORT)
+    
+    # Track voice data per speaker
+    speaker_buffers = {}
+    
+    def handle_packet(packet_type, data):
+        if packet_type == 'voice_input':
+            sender_id = data['sender_id']
+            audio_data = data['data']
+            
+            # Buffer audio for each speaker
+            if sender_id not in speaker_buffers:
+                speaker_buffers[sender_id] = []
+            speaker_buffers[sender_id].append(audio_data)
+            
+            # Process when we have enough audio (~1 second)
+            if len(speaker_buffers[sender_id]) >= 50:  # ~1s at 20ms frames
+                process_voice(sender_id, speaker_buffers[sender_id])
+                speaker_buffers[sender_id] = []
+    
+    def process_voice(sender_id, audio_packets):
+        # Decode Opus and send to Whisper
+        # ... your AI processing here ...
+        print(f"Processing voice from user {sender_id}: {len(audio_packets)} packets")
+        
+        # If AI decides to respond, generate TTS and send
+        # response_audio = generate_tts("Hello!")
+        # client.send_audio(response_audio)
+        
+        # If AI decides to interrupt current playback
+        # client.stop_playback()
+    
+    # Start receiving in background thread
+    receiver_thread = threading.Thread(
+        target=client.receive_packets,
+        args=(handle_packet,)
+    )
+    receiver_thread.daemon = True
+    receiver_thread.start()
+    
+    try:
+        print("AI Assistant running... Press Ctrl+C to exit")
+        while True:
+            import time
+            time.sleep(1)
+    except KeyboardInterrupt:
+        print("Shutting down...")
+    finally:
+        client.close()
+
+if __name__ == '__main__':
+    main()
+```
+
+### Simple Voice Input Receiver
 ```python
 import socket
 import struct
@@ -59,48 +295,43 @@ import struct
 HOST = 'localhost'
 PORT = 9001
 
-# Connect to the bot
 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 sock.connect((HOST, PORT))
 
-print(f"Connected to TS3AudioBot TCP server at {HOST}:{PORT}")
+print(f"Connected to TS3AudioBot at {HOST}:{PORT}")
+print("Listening for voice input from TeamSpeak users...")
 
 try:
     while True:
-        # Read packet header (4 bytes length + 1 byte codec)
-        header = sock.recv(5)
-        if len(header) < 5:
+        # Read length
+        header = sock.recv(4)
+        if len(header) < 4:
             break
+        length = struct.unpack('<I', header)[0]
         
-        length = struct.unpack('<I', header[:4])[0]  # Little-endian int32
-        codec = header[4]
-        
-        # Read audio data
-        audio_data = b''
-        remaining = length
-        while remaining > 0:
-            chunk = sock.recv(min(remaining, 4096))
+        # Read packet data
+        data = b''
+        while len(data) < length:
+            chunk = sock.recv(length - len(data))
             if not chunk:
                 break
-            audio_data += chunk
-            remaining -= len(chunk)
+            data += chunk
         
-        print(f"Received packet: codec={codec}, length={length}")
+        packet_type = data[0]
         
-        # Process audio_data here
-        # For Opus codec (1), you'll need to decode it using an Opus decoder
-        # Example with opuslib:
-        # import opuslib
-        # decoder = opuslib.Decoder(48000, 2)
-        # pcm_data = decoder.decode(audio_data, frame_size=960)
-        
+        if packet_type == 1:  # VoiceInput
+            sender_id = struct.unpack('<H', data[1:3])[0]
+            codec = data[3]
+            audio_data = data[4:]
+            print(f"Voice from user {sender_id}: {len(audio_data)} bytes (codec: {codec})")
+            
 except KeyboardInterrupt:
     print("Disconnecting...")
 finally:
     sock.close()
 ```
 
-### Sending Audio Stream
+### Sending Stop/Interrupt Command
 ```python
 import socket
 import struct
@@ -111,67 +342,46 @@ PORT = 9001
 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 sock.connect((HOST, PORT))
 
-# Encode your audio to Opus first
-# import opuslib
-# encoder = opuslib.Encoder(48000, 2, opuslib.APPLICATION_AUDIO)
-# opus_data = encoder.encode(pcm_samples, frame_size=960)
-
-# Example: send encoded Opus data
-opus_data = b'...'  # Your Opus-encoded audio data
-codec = 1  # OpusMusic
-
-# Build packet
-packet = struct.pack('<I', len(opus_data)) + bytes([codec]) + opus_data
-
-# Send to bot
+# Send stop command
+# [Length:4][PacketType:1=3][CommandType:1=0]
+packet = struct.pack('<I', 2) + bytes([3, 0])  # Length=2, PacketType=3 (Command), CommandType=0 (Stop)
 sock.sendall(packet)
 
+print("Stop command sent!")
 sock.close()
 ```
 
-## Advanced Usage with AI Processing
+## Multi-User Voice Handling
 
-### Example: Speech-to-Text Processing
+When multiple users speak simultaneously in TeamSpeak, the bot receives and forwards **separate voice packets for each user**. Each packet includes:
+- **SenderId**: The unique TeamSpeak ClientId identifying the speaker
+
+Your Python client should:
+1. **Track packets by SenderId** to keep voice data separate per user
+2. **Buffer audio per user** for speech recognition processing
+3. **Mix audio if needed** for scenarios where you need combined audio
+
+Example handling multiple speakers:
 ```python
-import socket
-import struct
-import opuslib
-from your_ai_library import speech_to_text
+speaker_buffers = {}  # SenderId -> list of audio packets
 
-decoder = opuslib.Decoder(48000, 2)
-sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-sock.connect(('localhost', 9001))
-
-pcm_buffer = []
-
-while True:
-    header = sock.recv(5)
-    if len(header) < 5:
-        break
+def handle_voice_packet(sender_id, audio_data):
+    if sender_id not in speaker_buffers:
+        speaker_buffers[sender_id] = []
+    speaker_buffers[sender_id].append(audio_data)
     
-    length, codec = struct.unpack('<IB', header)
-    audio_data = sock.recv(length)
-    
-    # Decode Opus to PCM
-    pcm_samples = decoder.decode(audio_data, frame_size=960)
-    pcm_buffer.append(pcm_samples)
-    
-    # Process every 3 seconds of audio
-    if len(pcm_buffer) >= 150:  # ~3 seconds at 20ms frames
-        full_audio = b''.join(pcm_buffer)
-        text = speech_to_text(full_audio)
-        print(f"Transcribed: {text}")
-        pcm_buffer.clear()
-
-sock.close()
+    # Process each speaker independently
+    if len(speaker_buffers[sender_id]) >= 50:  # ~1 second
+        process_speaker(sender_id, speaker_buffers[sender_id])
+        speaker_buffers[sender_id] = []
 ```
 
 ## Notes
 - The TCP server starts when the bot connects to TeamSpeak
 - The TCP server stops when the bot disconnects from TeamSpeak
 - Multiple clients can connect simultaneously
-- Audio is broadcasted to all connected clients
-- Incoming audio from clients is currently logged but not yet injected into the bot's audio pipeline (future enhancement)
+- Audio is broadcast to all connected clients
+- Voice input from TS users is broadcast to all TCP clients with sender identification
 
 ## Dependencies
 For Python clients working with Opus codec:
@@ -186,5 +396,6 @@ You'll also need the Opus library installed on your system:
 
 ## Troubleshooting
 - **Connection refused**: Ensure the bot is connected and `tcp_server.enabled = true` in config
-- **No audio received**: Check that `tcp_server.send_audio = true` and the bot is playing audio
-- **Decode errors**: Verify you're using the correct Opus decoder settings (48kHz, stereo)
+- **No audio received**: Check that `tcp_server.send_audio = true` and someone is speaking/playing
+- **No voice input**: Ensure users are speaking in TeamSpeak and the bot can hear them
+- **Decode errors**: Verify you're using the correct Opus decoder settings (48kHz)
